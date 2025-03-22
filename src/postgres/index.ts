@@ -96,7 +96,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "query",
-        description: "Run a read-only SQL query",
+        description: "Run a SQL query (read or write)",
         inputSchema: {
           type: "object",
           properties: {
@@ -104,35 +104,141 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
         },
       },
+      {
+        name: "insert",
+        description: "Insert data into a table",
+        inputSchema: {
+          type: "object",
+          properties: {
+            table: { type: "string" },
+            data: { 
+              type: "object",
+              additionalProperties: true
+            },
+          },
+          required: ["table", "data"],
+        },
+      },
+      {
+        name: "update",
+        description: "Update data in a table",
+        inputSchema: {
+          type: "object",
+          properties: {
+            table: { type: "string" },
+            data: { 
+              type: "object",
+              additionalProperties: true
+            },
+            where: { 
+              type: "object",
+              additionalProperties: true
+            },
+          },
+          required: ["table", "data", "where"],
+        },
+      },
+      {
+        name: "delete",
+        description: "Delete data from a table",
+        inputSchema: {
+          type: "object",
+          properties: {
+            table: { type: "string" },
+            where: { 
+              type: "object",
+              additionalProperties: true
+            },
+          },
+          required: ["table", "where"],
+        },
+      },
     ],
   };
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name === "query") {
-    const sql = request.params.arguments?.sql as string;
+  const client = await pool.connect();
+  try {
+    switch (request.params.name) {
+      case "query": {
+        const sql = request.params.arguments?.sql as string;
+        const result = await client.query(sql);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
+          isError: false,
+        };
+      }
 
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN TRANSACTION READ ONLY");
-      const result = await client.query(sql);
-      return {
-        content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
-        isError: false,
-      };
-    } catch (error) {
-      throw error;
-    } finally {
-      client
-        .query("ROLLBACK")
-        .catch((error) =>
-          console.warn("Could not roll back transaction:", error),
-        );
+      case "insert": {
+        const { table, data } = request.params.arguments as { table: string; data: Record<string, any> };
+        const columns = Object.keys(data);
+        const values = Object.values(data);
+        const placeholders = values.map((_, i) => `$${i + 1}`).join(", ");
+        
+        const sql = `INSERT INTO "${table}" (${columns.map(c => `"${c}"`).join(", ")}) VALUES (${placeholders}) RETURNING *`;
+        const result = await client.query(sql, values);
+        
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.rows[0], null, 2) }],
+          isError: false,
+        };
+      }
 
-      client.release();
+      case "update": {
+        const { table, data, where } = request.params.arguments as { 
+          table: string; 
+          data: Record<string, any>;
+          where: Record<string, any>;
+        };
+
+        const setColumns = Object.keys(data);
+        const setValues = Object.values(data);
+        const whereColumns = Object.keys(where);
+        const whereValues = Object.values(where);
+        
+        const setClause = setColumns.map((col, i) => `"${col}" = $${i + 1}`).join(", ");
+        const whereClause = whereColumns.map((col, i) => `"${col}" = $${i + 1 + setValues.length}`).join(" AND ");
+        
+        const sql = `UPDATE "${table}" SET ${setClause} WHERE ${whereClause} RETURNING *`;
+        const result = await client.query(sql, [...setValues, ...whereValues]);
+        
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
+          isError: false,
+        };
+      }
+
+      case "delete": {
+        const { table, where } = request.params.arguments as {
+          table: string;
+          where: Record<string, any>;
+        };
+
+        const whereColumns = Object.keys(where);
+        const whereValues = Object.values(where);
+        const whereClause = whereColumns.map((col, i) => `"${col}" = $${i + 1}`).join(" AND ");
+        
+        const sql = `DELETE FROM "${table}" WHERE ${whereClause} RETURNING *`;
+        const result = await client.query(sql, whereValues);
+        
+        return {
+          content: [{ type: "text", text: JSON.stringify(result.rows, null, 2) }],
+          isError: false,
+        };
+      }
+
+      default:
+        throw new Error(`Unknown tool: ${request.params.name}`);
     }
+  } catch (error) {
+    return {
+      content: [{ type: "text", text: `Error: ${error.message}` }],
+      isError: true,
+    };
+  } finally {
+    client.release();
   }
-  throw new Error(`Unknown tool: ${request.params.name}`);
 });
 
 async function runServer() {
